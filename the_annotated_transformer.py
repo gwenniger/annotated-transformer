@@ -13,6 +13,7 @@
 #     language: python
 #     name: python3
 # ---
+
 # %% [markdown] id="SX7UC-8jTsp7" tags=[]
 #
 # <center><h1>The Annotated Transformer</h1> </center>

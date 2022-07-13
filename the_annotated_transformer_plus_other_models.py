@@ -804,7 +804,6 @@ def example_positional():
 
 show_example(example_positional)
 
-
 # %% [markdown] id="g8rZNCrzTsqI"
 #
 # We also experimented with using learned positional embeddings
@@ -814,27 +813,49 @@ show_example(example_positional)
 # to sequence lengths longer than the ones encountered during
 # training.
 
+# %% [markdown]
+# ## BiLSTM+Attention Model
+# Here we specify code for the alternative BiLSTM with attention model (Bahdenau et.al)
+
 # %% [markdown] id="iwNKCzlyTsqI"
 # ## Full Model
 #
 # > Here we define a function from hyperparameters to a full model.
 
 # %% id="mPe1ES0UTsqI"
-def make_model(
-    src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1
-):
-    "Helper: Construct a model from hyperparameters."
-    c = copy.deepcopy
-    attn = MultiHeadedAttention(h, d_model)
-    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
-    position = PositionalEncoding(d_model, dropout)
-    model = EncoderDecoder(
+from enum import Enum
+class ModelType(Enum):
+    """
+    Enumeration class, used for specifying the model (encoder-decoder) type
+    """
+    TRANSFORMER = 1
+    BILSTM_WITH_ATTENTION = 2
+
+def create_model(model_type):
+    if model_type == ModelType.TRANSFORMER:
+        model = EncoderDecoder(
         Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
         Decoder(DecoderLayer(d_model, c(attn), c(attn), c(ff), dropout), N),
         nn.Sequential(Embeddings(d_model, src_vocab), c(position)),
         nn.Sequential(Embeddings(d_model, tgt_vocab), c(position)),
         Generator(d_model, tgt_vocab),
     )
+        
+    elif model_type == ModelType.BILSTM_WITH_ATTENTION:
+        #TODO: Add code for creating a BiLSTM with attention model here
+        raise RuntimeError("Not implemented!")
+    return model
+    
+    
+def make_model(
+    src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1, model_type: ModelType = ModelType.TRANSFORMER
+):
+    "Helper: Construct a model from hyperparameters."
+    c = copy.deepcopy
+    attn = MultiHeadedAttention(h, d_model)
+    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+    position = PositionalEncoding(d_model, dropout)
+    model = create_model(model_type)
 
     # This was important from their code.
     # Initialize parameters with Glorot / fan_avg.
@@ -1737,7 +1758,7 @@ def train_model(vocab_src, vocab_tgt, spacy_de, spacy_en, config):
         )
 
 
-def load_trained_model():
+def load_trained_model(model_type: ModelType = ModelType.TRANSFORMER):
     config = {
         "batch_size": 32,
         "distributed": False,
@@ -1747,6 +1768,7 @@ def load_trained_model():
         "max_padding": 72,
         "warmup": 3000,
         "file_prefix": "multi30k_model_",
+        "model_type": model_type
     }
     model_path = "multi30k_model_final.pt"
     if not exists(model_path):
@@ -1758,7 +1780,7 @@ def load_trained_model():
 
 
 if is_interactive_notebook():
-    model = load_trained_model()
+    model = load_trained_model(ModelType.TRANSFORMER)
 
 
 # %% [markdown] id="RZK_VjDPTsqN"
