@@ -1581,8 +1581,8 @@ class SimpleLossCompute:
 # %% [markdown] id="LFkWakplTsqL" tags=[]
 # > This code predicts a translation using greedy decoding for simplicity.
 # %% id="N2UOpnT3bIyU"
-def greedy_decode(model, src, src_mask, max_len, start_symbol):
-    memory = model.encode(src, src_mask)
+def greedy_decode(model, src, src_mask, src_lengths, max_len, start_symbol):
+    memory = model.encode(src, src_mask)  # Original for Transformer model
     ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
     for i in range(max_len - 1):
         out = model.decode(
@@ -1595,6 +1595,52 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
             [ys, torch.zeros(1, 1).type_as(src.data).fill_(next_word)], dim=1
         )
     return ys
+
+def greedy_decode_type_two(model, src, src_mask, src_lengths, max_len=100, sos_index=1, eos_index=None):
+    """Greedily decode a sentence."""
+
+    with torch.no_grad():
+        encoder_hidden, encoder_final = model.encode(src, src_mask, src_lengths)
+        prev_y = torch.ones(1, 1).fill_(sos_index).type_as(src)
+        trg_mask = torch.ones_like(prev_y)
+
+    output = []
+    attention_scores = []
+    hidden = None
+
+    for i in range(max_len):
+        with torch.no_grad():
+            out, hidden, pre_output = model.decode(
+              encoder_hidden, encoder_final, src_mask,
+              prev_y, trg_mask, hidden)
+
+            # we predict from the pre-output layer, which is
+            # a combination of Decoder state, prev emb, and context
+            prob = model.generator(pre_output[:, -1])
+
+        _, next_word = torch.max(prob, dim=1)
+        next_word = next_word.data.item()
+        output.append(next_word)
+        prev_y = torch.ones(1, 1).type_as(src).fill_(next_word)
+        attention_scores.append(model.decoder.attention.alphas.cpu().numpy())
+    
+    output = np.array(output)
+        
+    # cut off everything starting from </s> 
+    # (only when eos_index provided)
+    if eos_index is not None:
+        first_eos = np.where(output==eos_index)[0]
+        if len(first_eos) > 0:
+            output = output[:first_eos[0]]      
+    
+    return output, np.concatenate(attention_scores, axis=1)
+  
+
+def lookup_words(x, vocab=None):
+    if vocab is not None:
+        x = [vocab.itos[i] for i in x]
+
+    return [str(t) for t in x]
 
 
 # %% id="qgIZ2yEtdYwe" tags=[]
@@ -2213,7 +2259,12 @@ def check_outputs(
         print("\nExample %d ========\n" % idx)
         b = next(iter(valid_dataloader))
         rb = Batch(b[0], b[1], pad_idx)
-        greedy_decode(model, rb.src, rb.src_mask, 64, 0)[0]
+        
+        if isinstance(model,EncoderDecoderTypeTwo):
+            greedy_decode_type_two(model, rb.src, rb.src_mask,rb.src_lengths, 64, 0)[0]
+        else:
+            greedy_decode(model, rb.src, rb.src_mask, 64, 0)[0]
+        
 
         src_tokens = [
             vocab_src.get_itos()[x] for x in rb.src[0] if x != pad_idx
@@ -2230,7 +2281,11 @@ def check_outputs(
             "Target Text (Ground Truth) : "
             + " ".join(tgt_tokens).replace("\n", "")
         )
-        model_out = greedy_decode(model, rb.src, rb.src_mask, 72, 0)[0]
+        
+        if isinstance(model,EncoderDecoderTypeTwo):
+            model_out = greedy_decode_type_two(model, rb.src, rb.src_mask,rb.src_lengths, 72, 0)[0]
+        else:
+            model_out = greedy_decode(model, rb.src, rb.src_mask,rb.src_lengths, 72, 0)[0]
         model_txt = (
             " ".join(
                 [vocab_tgt.get_itos()[x] for x in model_out if x != pad_idx]
@@ -2258,9 +2313,41 @@ def run_model_example(n_examples=5):
 
     print("Loading Trained Model ...")
 
-    model = make_model(ModelType.TRANSFORMERlen(vocab_src), len(vocab_tgt), N=6)
+    model = make_model(ModelType.TRANSFORMER,len(vocab_src), len(vocab_tgt), N=6)
     model.load_state_dict(
         torch.load("multi30k_model_final.pt", map_location=torch.device("cpu"))
+        
+    )
+
+    print("Checking Model Outputs:")
+    example_data = check_outputs(
+        valid_dataloader, model, vocab_src, vocab_tgt, n_examples=n_examples
+    )
+    return model, example_data
+
+
+def run_model_example_bahdenau(n_examples=5):
+    global vocab_src, vocab_tgt, spacy_de, spacy_en
+
+    print("Preparing Data ...")
+    _, valid_dataloader = create_dataloaders(
+        torch.device("cpu"),
+        vocab_src,
+        vocab_tgt,
+        spacy_de,
+        spacy_en,
+        batch_size=1,
+        is_distributed=False,
+    )
+
+    print("Loading Trained Model ...")
+
+    model = make_model(ModelType.BILSTM_WITH_ATTENTION,len(vocab_src), len(vocab_tgt), N=6)
+    #model.load_state_dict(
+    #    torch.load("multi30k_model_final.pt", map_location=torch.device("cpu"))
+    model.load_state_dict(
+        torch.load("multi30k_bahdenau_et_al_model_02.pt", map_location=torch.device("cpu"))
+        
     )
 
     print("Checking Model Outputs:")
@@ -2368,9 +2455,23 @@ def visualize_layer(model, layer, getter_fn, ntokens, row_tokens, col_tokens):
 
 
 # %% [markdown]
+# ## Bahdenau model translation test
+
+# %%
+USE_CUDA = False
+
+def test_bahdenau_model():
+    model, example_data = run_model_example_bahdenau(n_examples=10)
+    
+
+test_bahdenau_model()
+
+# %% [markdown]
 # ## Encoder Self Attention
 
 # %% tags=[]
+USE_CUDA = False
+
 def viz_encoder_self():
     model, example_data = run_model_example(n_examples=1)
     example = example_data[
