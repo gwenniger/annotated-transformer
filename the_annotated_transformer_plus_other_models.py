@@ -815,12 +815,223 @@ show_example(example_positional)
 
 # %% [markdown]
 # ## BiLSTM+Attention Model
+#
 # Here we specify code for the alternative BiLSTM with attention model (Bahdenau et.al)
+
+# %% [markdown]
+# ### RNN-based encoders
+# Next, we can import the RNN-style encoders code
+
+# %%
+# Code taken from https://bastings.github.io/annotated_encoder_decoder/
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+USE_CUDA = True
+
+class BiGRUEncoder(nn.Module):
+    """Encodes a sequence of word embeddings"""
+    def __init__(self, input_size, hidden_size, num_layers=1, dropout=0.):
+        super(BiGRUEncoder, self).__init__()
+        self.num_layers = num_layers
+        self.rnn = nn.GRU(input_size, hidden_size, num_layers, 
+                          batch_first=True, bidirectional=True, dropout=dropout)
+        
+    def forward(self, x, mask, lengths):
+        """
+        Applies a bidirectional GRU to sequence of embeddings x.
+        The input mini-batch x needs to be sorted by length.
+        x should have dimensions [batch, time, dim].
+        """
+        packed = pack_padded_sequence(x, lengths, batch_first=True)
+        output, final = self.rnn(packed)
+        output, _ = pad_packed_sequence(output, batch_first=True)
+
+        # we need to manually concatenate the final states for both directions
+        fwd_final = final[0:final.size(0):2]
+        bwd_final = final[1:final.size(0):2]
+        final = torch.cat([fwd_final, bwd_final], dim=2)  # [num_layers, batch, 2*dim]
+
+        return output, final
+
+
+# %% [markdown]
+# ## RNN-based decoder
+
+# %%
+# Code adapted from:
+# https://bastings.github.io/annotated_encoder_decoder/
+
+class RNNDecoder(nn.Module):
+    """A conditional RNN decoder with attention."""
+    
+    def __init__(self, emb_size, hidden_size, attention, num_layers=1, dropout=0.5,
+                 bridge=True):
+        super(RNNDecoder, self).__init__()
+        
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.attention = attention
+        self.dropout = dropout
+                 
+        self.rnn = nn.GRU(emb_size + 2*hidden_size, hidden_size, num_layers,
+                          batch_first=True, dropout=dropout)
+                 
+        # to initialize from the final encoder state
+        self.bridge = nn.Linear(2*hidden_size, hidden_size, bias=True) if bridge else None
+
+        self.dropout_layer = nn.Dropout(p=dropout)
+        self.pre_output_layer = nn.Linear(hidden_size + 2*hidden_size + emb_size,
+                                          hidden_size, bias=False)
+        
+    def forward_step(self, prev_embed, encoder_hidden, src_mask, proj_key, hidden):
+        """Perform a single decoder step (1 word)"""
+
+        # compute context vector using attention mechanism
+        query = hidden[-1].unsqueeze(1)  # [#layers, B, D] -> [B, 1, D]
+        context, attn_probs = self.attention(
+            query=query, proj_key=proj_key,
+            value=encoder_hidden, mask=src_mask)
+
+        # update rnn hidden state
+        rnn_input = torch.cat([prev_embed, context], dim=2)
+        output, hidden = self.rnn(rnn_input, hidden)
+        
+        pre_output = torch.cat([prev_embed, output, context], dim=2)
+        pre_output = self.dropout_layer(pre_output)
+        pre_output = self.pre_output_layer(pre_output)
+
+        return output, hidden, pre_output
+    
+    def forward(self, trg_embed, encoder_hidden, encoder_final, 
+                src_mask, trg_mask, hidden=None, max_len=None):
+        """Unroll the decoder one step at a time."""
+                                         
+        # the maximum number of steps to unroll the RNN
+        if max_len is None:
+            max_len = trg_mask.size(-1)
+
+        # initialize decoder hidden state
+        if hidden is None:
+            hidden = self.init_hidden(encoder_final)
+        
+        # pre-compute projected encoder hidden states
+        # (the "keys" for the attention mechanism)
+        # this is only done for efficiency
+        proj_key = self.attention.key_layer(encoder_hidden)
+        
+        # here we store all intermediate hidden states and pre-output vectors
+        decoder_states = []
+        pre_output_vectors = []
+        
+        # unroll the decoder RNN for max_len steps
+        for i in range(max_len):
+            prev_embed = trg_embed[:, i].unsqueeze(1)
+            output, hidden, pre_output = self.forward_step(
+              prev_embed, encoder_hidden, src_mask, proj_key, hidden)
+            decoder_states.append(output)
+            pre_output_vectors.append(pre_output)
+
+        decoder_states = torch.cat(decoder_states, dim=1)
+        pre_output_vectors = torch.cat(pre_output_vectors, dim=1)
+        return decoder_states, hidden, pre_output_vectors  # [B, N, D]
+
+    def init_hidden(self, encoder_final):
+        """Returns the initial decoder state,
+        conditioned on the final encoder state."""
+
+        if encoder_final is None:
+            return None  # start with zeros
+
+        return torch.tanh(self.bridge(encoder_final))    
+
+
+# %% [markdown]
+# ## Bahdenau attention
+
+# %%
+class BahdanauAttention(nn.Module):
+    """Implements Bahdanau (MLP) attention"""
+    
+    def __init__(self, hidden_size, key_size=None, query_size=None):
+        super(BahdanauAttention, self).__init__()
+        
+        # We assume a bi-directional encoder so key_size is 2*hidden_size
+        key_size = 2 * hidden_size if key_size is None else key_size
+        query_size = hidden_size if query_size is None else query_size
+
+        self.key_layer = nn.Linear(key_size, hidden_size, bias=False)
+        self.query_layer = nn.Linear(query_size, hidden_size, bias=False)
+        self.energy_layer = nn.Linear(hidden_size, 1, bias=False)
+        
+        # to store attention scores
+        self.alphas = None
+        
+    def forward(self, query=None, proj_key=None, value=None, mask=None):
+        assert mask is not None, "mask is required"
+
+        # print("query.size(): " + str(query.size()))
+        # print("proj_key.size(): " + str(proj_key.size()))
+        
+        # We first project the query (the decoder state).
+        # The projected keys (the encoder states) were already pre-computated.
+        query = self.query_layer(query)
+        
+        # Calculate scores.
+        scores = self.energy_layer(torch.tanh(query + proj_key))
+        scores = scores.squeeze(2).unsqueeze(1)
+        
+        
+        # print("scores.size(): " + str(scores.size()))
+        # print("mask.size(): " + str(mask.size()))
+        # Mask out invalid positions.
+        # The mask marks valid positions so we invert it using `mask & 0`.
+        scores.data.masked_fill_(mask == 0, -float('inf'))
+        
+        
+        # Turn scores to probabilities.
+        alphas = F.softmax(scores, dim=-1)
+        self.alphas = alphas        
+        
+        # The context vector is the weighted sum of the values.
+        context = torch.bmm(alphas, value)
+        
+        # context shape: [B, 1, 2D], alphas shape: [B, 1, M]
+        return context, alphas
+
 
 # %% [markdown] id="iwNKCzlyTsqI"
 # ## Full Model
 #
 # > Here we define a function from hyperparameters to a full model.
+
+# %%
+class EncoderDecoderTypeTwo(nn.Module):
+    """
+    A standard Encoder-Decoder architecture. Base for this and many 
+    other models.
+    
+    This model has slighly different inputs, including src and tgt lengths
+    """
+    def __init__(self, encoder, decoder, src_embed, trg_embed, generator):
+        super(EncoderDecoderTypeTwo, self).__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.src_embed = src_embed
+        self.trg_embed = trg_embed
+        self.generator = generator
+        
+    def forward(self, src, trg, src_mask, trg_mask, src_lengths, trg_lengths):
+        """Take in and process masked src and target sequences."""
+        encoder_hidden, encoder_final = self.encode(src, src_mask, src_lengths)
+        return self.decode(encoder_hidden, encoder_final, src_mask, trg, trg_mask)
+    
+    def encode(self, src, src_mask, src_lengths):
+        return self.encoder(self.src_embed(src), src_mask, src_lengths)
+    
+    def decode(self, encoder_hidden, encoder_final, src_mask, trg, trg_mask,
+               decoder_hidden=None):
+        return self.decoder(self.trg_embed(trg), encoder_hidden, encoder_final,
+                            src_mask, trg_mask, hidden=decoder_hidden)
+
 
 # %% id="mPe1ES0UTsqI"
 from enum import Enum
@@ -830,8 +1041,30 @@ class ModelType(Enum):
     """
     TRANSFORMER = 1
     BILSTM_WITH_ATTENTION = 2
+    
+def create_bahdenau_model(src_vocab, tgt_vocab, emb_size=256, hidden_size=512, num_layers=1, dropout=0.1):
+    "Helper: Construct a model from hyperparameters."
 
-def create_model(model_type):
+    print("Entered create_bahdenau_model...")
+    attention = BahdanauAttention(hidden_size)
+
+    model = EncoderDecoderTypeTwo(
+        BiGRUEncoder(emb_size, hidden_size, num_layers=num_layers, dropout=dropout),
+        RNNDecoder(emb_size, hidden_size, attention, num_layers=num_layers, dropout=dropout),
+        nn.Embedding(src_vocab, emb_size),
+        nn.Embedding(tgt_vocab, emb_size),
+        Generator(hidden_size, tgt_vocab))
+
+    return model.cuda() if USE_CUDA else model
+    
+    
+def make_model(model_type: ModelType, src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1, ):
+    "Helper: Construct a model from hyperparameters."
+    c = copy.deepcopy
+    attn = MultiHeadedAttention(h, d_model)
+    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
+    position = PositionalEncoding(d_model, dropout)
+    
     if model_type == ModelType.TRANSFORMER:
         model = EncoderDecoder(
         Encoder(EncoderLayer(d_model, c(attn), c(ff), dropout), N),
@@ -843,19 +1076,11 @@ def create_model(model_type):
         
     elif model_type == ModelType.BILSTM_WITH_ATTENTION:
         #TODO: Add code for creating a BiLSTM with attention model here
-        raise RuntimeError("Not implemented!")
-    return model
+        num_layers=1
+        emb_size=256
+        hidden_size=d_model
+        model = create_bahdenau_model(src_vocab, tgt_vocab, emb_size, hidden_size, num_layers, dropout)
     
-    
-def make_model(
-    src_vocab, tgt_vocab, N=6, d_model=512, d_ff=2048, h=8, dropout=0.1, model_type: ModelType = ModelType.TRANSFORMER
-):
-    "Helper: Construct a model from hyperparameters."
-    c = copy.deepcopy
-    attn = MultiHeadedAttention(h, d_model)
-    ff = PositionwiseFeedForward(d_model, d_ff, dropout)
-    position = PositionalEncoding(d_model, dropout)
-    model = create_model(model_type)
 
     # This was important from their code.
     # Initialize parameters with Glorot / fan_avg.
@@ -877,7 +1102,7 @@ def make_model(
 
 # %%
 def inference_test():
-    test_model = make_model(11, 11, 2)
+    test_model = make_model(ModelType.TRANSFORMER, 11, 11, 2)
     test_model.eval()
     src = torch.LongTensor([[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]])
     src_mask = torch.ones(1, 1, 10)
@@ -930,13 +1155,31 @@ class Batch:
     """Object for holding a batch of data with mask during training."""
 
     def __init__(self, src, tgt=None, pad=2):  # 2 = <blank>
+        #print("src: " + str(src))
+        
+        #self.src = src
+        ### Adapted from https://bastings.github.io/annotated_encoder_decoder/ to include src_lengths
+        src, src_lengths = src
+        # print("src.size(): " + str(src.size()))
         self.src = src
+        self.src_lengths = src_lengths
+        
         self.src_mask = (src != pad).unsqueeze(-2)
+        self.tgt_lengths = None
         if tgt is not None:
+            ### Adapted from https://bastings.github.io/annotated_encoder_decoder/ to include tgt_lengths
+            tgt, tgt_lengths = tgt
             self.tgt = tgt[:, :-1]
+            self.tgt_lengths = tgt_lengths
             self.tgt_y = tgt[:, 1:]
+            
             self.tgt_mask = self.make_std_mask(self.tgt, pad)
+            #self.tgt_y = tgt[:, 1:]
+            #self.tgt_mask = (self.tgt_y != pad)
+            
             self.ntokens = (self.tgt_y != pad).data.sum()
+        #print("self.src_mask.size(): " + str(self.src_mask.size()))
+        #print("self.tgt_mask.size(): " + str(self.tgt_mask.size()))
 
     @staticmethod
     def make_std_mask(tgt, pad):
@@ -946,6 +1189,7 @@ class Batch:
             tgt_mask.data
         )
         return tgt_mask
+    
 
 
 # %% [markdown] id="cKkw5GjLTsqI"
@@ -985,9 +1229,14 @@ def run_epoch(
     tokens = 0
     n_accum = 0
     for i, batch in enumerate(data_iter):
-        out = model.forward(
-            batch.src, batch.tgt, batch.src_mask, batch.tgt_mask
-        )
+        if isinstance(model, EncoderDecoderTypeTwo):
+            _, _, out = model.forward(
+                batch.src, batch.tgt, batch.src_mask, batch.tgt_mask, batch.src_lengths, batch.tgt_lengths)
+        else:
+            out = model.forward(
+                batch.src, batch.tgt, batch.src_mask, batch.tgt_mask)
+        # print("out: " + str(out))
+        # print("out.size(): " + str(out.size()))
         loss, loss_node = loss_compute(out, batch.tgt_y, batch.ntokens)
         # loss_node = loss_node / accum_iter
         if mode == "train" or mode == "train+log":
@@ -1355,7 +1604,7 @@ def greedy_decode(model, src, src_mask, max_len, start_symbol):
 def example_simple_model():
     V = 11
     criterion = LabelSmoothing(size=V, padding_idx=0, smoothing=0.0)
-    model = make_model(V, V, N=2)
+    model = make_model(ModelType.TRANSFORMER, V, V, N=2)
 
     optimizer = torch.optim.Adam(
         model.parameters(), lr=0.5, betas=(0.9, 0.98), eps=1e-9
@@ -1507,6 +1756,31 @@ if is_interactive_notebook():
 # ## Iterators
 
 # %% id="wGsIHFgOokC_" tags=[]
+def get_max_src_length_within_batch(batch, src_pipeline,
+    tgt_pipeline,
+    src_vocab,
+    tgt_vocab,
+    device):
+    result = 0
+    bs_id = torch.tensor([0], device=device)  # <s> token id
+    eos_id = torch.tensor([1], device=device)  # </s> token id
+    for (_src, _) in batch:
+        processed_src = torch.cat(
+            [
+                bs_id,
+                torch.tensor(
+                    src_vocab(src_pipeline(_src)),
+                    dtype=torch.int64,
+                    device=device,
+                ),
+                eos_id,
+            ],
+            0,
+        )
+        src_length =  len(processed_src)
+        result = max(result, src_length)
+    return result
+
 def collate_batch(
     batch,
     src_pipeline,
@@ -1517,9 +1791,17 @@ def collate_batch(
     max_padding=128,
     pad_id=2,
 ):
+    
+    max_padding_source = get_max_src_length_within_batch(batch, src_pipeline,
+    tgt_pipeline,
+    src_vocab,
+    tgt_vocab,
+    device)
+    
     bs_id = torch.tensor([0], device=device)  # <s> token id
     eos_id = torch.tensor([1], device=device)  # </s> token id
     src_list, tgt_list = [], []
+    src_lengths_list, tgt_lengths_list = [], []
     for (_src, _tgt) in batch:
         processed_src = torch.cat(
             [
@@ -1545,13 +1827,19 @@ def collate_batch(
             ],
             0,
         )
+        src_length =  len(processed_src)
+        src_lengths_list.append(src_length)
+        tgt_length =  len(processed_tgt)
+        tgt_lengths_list.append(tgt_length)
+        
         src_list.append(
             # warning - overwrites values for negative values of padding - len
             pad(
                 processed_src,
                 (
                     0,
-                    max_padding - len(processed_src),
+                    #max_padding - src_length,
+                    max_padding_source - src_length,
                 ),
                 value=pad_id,
             )
@@ -1559,14 +1847,32 @@ def collate_batch(
         tgt_list.append(
             pad(
                 processed_tgt,
-                (0, max_padding - len(processed_tgt)),
+                (0, max_padding - tgt_length,
+                ),
                 value=pad_id,
             )
         )
+        #print(" src_length:" + str(src_length))
+        #print(" tgt_length:" + str(tgt_length))
 
+    
+    # Determine a sorting order so that elements are sorted by the src length, increasing 
+    # https://stackoverflow.com/questions/7851077/how-to-return-index-of-a-sorted-list
+    sorting_order = sorted(range(len(src_lengths_list)), key=lambda k: src_lengths_list[k], reverse=True)
+    # Reorder all the lists according to sorting order
+    src_lengths_list = [src_lengths_list[i] for i in sorting_order]
+    tgt_lengths_list = [tgt_lengths_list[i] for i in sorting_order]
+    src_list = [src_list[i] for i in sorting_order]
+    tgt_list = [tgt_list[i] for i in sorting_order]
+        
+    # Convert int lists to torch tensors
+    src_lengths = torch.tensor(src_lengths_list,dtype=torch.int)
+    tgt_lengths = torch.tensor(tgt_lengths_list,dtype=torch.int)
+            
     src = torch.stack(src_list)
     tgt = torch.stack(tgt_list)
-    return (src, tgt)
+    #return (src, tgt)
+    return ((src,src_lengths), (tgt, tgt_lengths))
 
 
 # %% id="ka2Ce_WIokC_" tags=[]
@@ -1632,6 +1938,7 @@ def create_dataloaders(
 
 
 # %% [markdown] id="90qM8RzCTsqM"
+#
 # ## Training the System
 
 # %%
@@ -1650,7 +1957,7 @@ def train_worker(
 
     pad_idx = vocab_tgt["<blank>"]
     d_model = 512
-    model = make_model(len(vocab_src), len(vocab_tgt), N=6)
+    model = make_model(config["model_type"], len(vocab_src), len(vocab_tgt), N=6)
     model.cuda(gpu)
     module = model
     is_main_process = True
@@ -1677,7 +1984,7 @@ def train_worker(
         max_padding=config["max_padding"],
         is_distributed=is_distributed,
     )
-
+    
     optimizer = torch.optim.Adam(
         model.parameters(), lr=config["base_lr"], betas=(0.9, 0.98), eps=1e-9
     )
@@ -1758,7 +2065,16 @@ def train_model(vocab_src, vocab_tgt, spacy_de, spacy_en, config):
         )
 
 
+def get_file_prefix(model_type: ModelType):
+    if model_type == ModelType.TRANSFORMER:
+        return  "multi30k_model_"
+    elif model_type == ModelType.BILSTM_WITH_ATTENTION:
+        return "multi30k_bahdenau_et_al_model_"
+    else:
+        raise RuntimeError("Error: undefined model type!")
+        
 def load_trained_model(model_type: ModelType = ModelType.TRANSFORMER):
+    print("model type: " + str(model_type))
     config = {
         "batch_size": 32,
         "distributed": False,
@@ -1767,20 +2083,21 @@ def load_trained_model(model_type: ModelType = ModelType.TRANSFORMER):
         "base_lr": 1.0,
         "max_padding": 72,
         "warmup": 3000,
-        "file_prefix": "multi30k_model_",
+        "file_prefix": get_file_prefix(model_type),
         "model_type": model_type
     }
-    model_path = "multi30k_model_final.pt"
+    model_path = get_file_prefix(model_type) + "final.pt"
     if not exists(model_path):
         train_model(vocab_src, vocab_tgt, spacy_de, spacy_en, config)
 
-    model = make_model(len(vocab_src), len(vocab_tgt), N=6)
+    model = make_model(model_type, len(vocab_src), len(vocab_tgt), N=6)
     model.load_state_dict(torch.load("multi30k_model_final.pt"))
     return model
 
 
 if is_interactive_notebook():
-    model = load_trained_model(ModelType.TRANSFORMER)
+    #model = load_trained_model(ModelType.TRANSFORMER)
+    model = load_trained_model(ModelType.BILSTM_WITH_ATTENTION)
 
 
 # %% [markdown] id="RZK_VjDPTsqN"
@@ -1941,7 +2258,7 @@ def run_model_example(n_examples=5):
 
     print("Loading Trained Model ...")
 
-    model = make_model(len(vocab_src), len(vocab_tgt), N=6)
+    model = make_model(ModelType.TRANSFORMERlen(vocab_src), len(vocab_tgt), N=6)
     model.load_state_dict(
         torch.load("multi30k_model_final.pt", map_location=torch.device("cpu"))
     )
