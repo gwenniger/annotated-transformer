@@ -988,7 +988,7 @@ class BahdanauAttention(nn.Module):
         
         
         # Turn scores to probabilities.
-        alphas = F.softmax(scores, dim=-1)
+        alphas = torch.nn.functional.softmax(scores, dim=-1)
         self.alphas = alphas        
         
         # The context vector is the weighted sum of the values.
@@ -1581,7 +1581,9 @@ class SimpleLossCompute:
 # %% [markdown] id="LFkWakplTsqL" tags=[]
 # > This code predicts a translation using greedy decoding for simplicity.
 # %% id="N2UOpnT3bIyU"
-def greedy_decode(model, src, src_mask, src_lengths, max_len, start_symbol):
+import numpy as np
+
+def greedy_decode(model, src, src_mask, max_len, start_symbol):
     memory = model.encode(src, src_mask)  # Original for Transformer model
     ys = torch.zeros(1, 1).fill_(start_symbol).type_as(src.data)
     for i in range(max_len - 1):
@@ -1800,54 +1802,32 @@ if is_interactive_notebook():
 
 # %% [markdown] id="kDEj-hCgokC-" tags=[] jp-MarkdownHeadingCollapsed=true
 # ## Iterators
+#
+# >One of the main adaptations that needed to be made to the code is to adapt the collate_batch function 
+# >so that it returns tuples with src and src_lengths paired, and tgt and tgt_lengths paired.
+# >Whereas the Transformer model code does not require these src_lengths, the Bahdenau model code does.
+# >Originally the Bahdenau model code by Bastings worked with BucketIterator, but this is no longer available in newer
+# >PyTorch versions. Hence things have to be fixed more manually in the collate function, as done below for the 
+# >Transformer model and here adapted to also work for the Bahdenau model based on the code by Bastings.
 
 # %% id="wGsIHFgOokC_" tags=[]
-def get_max_src_length_within_batch(batch, src_pipeline,
-    tgt_pipeline,
-    src_vocab,
-    tgt_vocab,
-    device):
-    result = 0
-    bs_id = torch.tensor([0], device=device)  # <s> token id
-    eos_id = torch.tensor([1], device=device)  # </s> token id
-    for (_src, _) in batch:
-        processed_src = torch.cat(
-            [
-                bs_id,
-                torch.tensor(
-                    src_vocab(src_pipeline(_src)),
-                    dtype=torch.int64,
-                    device=device,
-                ),
-                eos_id,
-            ],
-            0,
-        )
-        src_length =  len(processed_src)
-        result = max(result, src_length)
-    return result
+def get_processed_examples_and_lengths(batch, src_pipeline, tgt_pipeline, src_vocab, tgt_vocab, device):
+    """
+    This function produces processed source and target examples, in torch tensor format, for further processing
+    by the collate_batch function.
+    By collecting src and tgt lengths while processing these examples, and returning them in a list
+    we can use them when computing the necessary padding in the collate_batch function. 
+    This prevents double work.
+    """
+   
 
-def collate_batch(
-    batch,
-    src_pipeline,
-    tgt_pipeline,
-    src_vocab,
-    tgt_vocab,
-    device,
-    max_padding=128,
-    pad_id=2,
-):
-    
-    max_padding_source = get_max_src_length_within_batch(batch, src_pipeline,
-    tgt_pipeline,
-    src_vocab,
-    tgt_vocab,
-    device)
-    
     bs_id = torch.tensor([0], device=device)  # <s> token id
     eos_id = torch.tensor([1], device=device)  # </s> token id
-    src_list, tgt_list = [], []
+   
+
+    processed_src_items_list, processed_tgt_items_list = [], []
     src_lengths_list, tgt_lengths_list = [], []
+   
     for (_src, _tgt) in batch:
         processed_src = torch.cat(
             [
@@ -1861,6 +1841,7 @@ def collate_batch(
             ],
             0,
         )
+        processed_src_items_list.append(processed_src)
         processed_tgt = torch.cat(
             [
                 bs_id,
@@ -1873,11 +1854,34 @@ def collate_batch(
             ],
             0,
         )
+        processed_tgt_items_list.append(processed_tgt)
+        
         src_length =  len(processed_src)
         src_lengths_list.append(src_length)
         tgt_length =  len(processed_tgt)
         tgt_lengths_list.append(tgt_length)
-        
+    return processed_src_items_list, processed_tgt_items_list, src_lengths_list, tgt_lengths_list
+
+
+def collate_batch(
+    batch,
+    src_pipeline,
+    tgt_pipeline,
+    src_vocab,
+    tgt_vocab,
+    device,
+    max_padding=128,
+    pad_id=2,
+):
+    
+    src_list, tgt_list = [], []
+    processed_src_items_list, processed_tgt_items_list, src_lengths_list, tgt_lengths_list =\
+        get_processed_examples_and_lengths(batch, src_pipeline,
+        tgt_pipeline, src_vocab, tgt_vocab, device)
+   
+    max_padding_source = max(src_lengths_list)
+
+    for processed_src, src_length in zip(processed_src_items_list, src_lengths_list):
         src_list.append(
             # warning - overwrites values for negative values of padding - len
             pad(
@@ -1890,6 +1894,7 @@ def collate_batch(
                 value=pad_id,
             )
         )
+    for processed_tgt, tgt_length in zip(processed_tgt_items_list, tgt_lengths_list):
         tgt_list.append(
             pad(
                 processed_tgt,
@@ -2122,7 +2127,8 @@ def get_file_prefix(model_type: ModelType):
 def load_trained_model(model_type: ModelType = ModelType.TRANSFORMER):
     print("model type: " + str(model_type))
     config = {
-        "batch_size": 32,
+        #"batch_size": 32,
+        "batch_size": 64,
         "distributed": False,
         "num_epochs": 8,
         "accum_iter": 10,
@@ -2261,7 +2267,7 @@ def check_outputs(
         rb = Batch(b[0], b[1], pad_idx)
         
         if isinstance(model,EncoderDecoderTypeTwo):
-            greedy_decode_type_two(model, rb.src, rb.src_mask,rb.src_lengths, 64, 0)[0]
+            greedy_decode_type_two(model, rb.src, rb.src_mask, rb.src_lengths, 64, 0)[0]
         else:
             greedy_decode(model, rb.src, rb.src_mask, 64, 0)[0]
         
@@ -2285,7 +2291,7 @@ def check_outputs(
         if isinstance(model,EncoderDecoderTypeTwo):
             model_out = greedy_decode_type_two(model, rb.src, rb.src_mask,rb.src_lengths, 72, 0)[0]
         else:
-            model_out = greedy_decode(model, rb.src, rb.src_mask,rb.src_lengths, 72, 0)[0]
+            model_out = greedy_decode(model, rb.src, rb.src_mask, 72, 0)[0]
         model_txt = (
             " ".join(
                 [vocab_tgt.get_itos()[x] for x in model_out if x != pad_idx]
